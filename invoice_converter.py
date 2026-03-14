@@ -15,7 +15,9 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -434,8 +436,19 @@ def build_ksef_xml(parsed, config):
     has_exempt = False
 
     for item in items:
-        price = money(get_attr(item, "price", "0"))
-        qty_str = get_attr(item, "quantity", "1")
+        price_str = get_attr(item, "price")
+        qty_str = get_attr(item, "quantity")
+        if not price_str:
+            desc = (item.text or "").strip()
+            raise ConversionError(
+                f"Missing 'price' attribute on orderItem '{desc}'"
+            )
+        if not qty_str:
+            desc = (item.text or "").strip()
+            raise ConversionError(
+                f"Missing 'quantity' attribute on orderItem '{desc}'"
+            )
+        price = money(price_str)
         quantity = Decimal(qty_str)
         rate_str = get_attr(item, "rateVAT", "high")
         vat_rate = resolve_vat_rate(rate_str, cfg_vat)
@@ -467,19 +480,26 @@ def build_ksef_xml(parsed, config):
             "remark": get_attr(item, "remark").strip(),
         })
 
+    # Merge VAT buckets by KSeF field pair to avoid duplicate P_13_x/P_14_x
+    field_buckets = {}
+    for rate, bucket in vat_buckets.items():
+        p13, p14 = get_ksef_vat_fields(rate)
+        fb = field_buckets.setdefault((p13, p14), {"net": Decimal("0"), "vat": Decimal("0")})
+        fb["net"] += bucket["net"]
+        fb["vat"] += bucket["vat"]
+
     # Write P_13_x / P_14_x fields — sorted: 23%, 8%, 5%, special, 0%, exempt
-    rate_sort_key = lambda r: (r is None, -(r or Decimal("0")))
+    field_sort_key = lambda k: k[0]
     total_net = Decimal("0")
     total_vat = Decimal("0")
 
-    for rate in sorted(vat_buckets, key=rate_sort_key):
-        bucket = vat_buckets[rate]
-        net = money(bucket["net"])
-        vat = money(bucket["vat"])
+    for (p13, p14) in sorted(field_buckets, key=field_sort_key):
+        fb = field_buckets[(p13, p14)]
+        net = money(fb["net"])
+        vat = money(fb["vat"])
         total_net += net
         total_vat += vat
 
-        p13, p14 = get_ksef_vat_fields(rate)
         ET.SubElement(fa, p13).text = str(net)
         if p14 and vat > 0:
             ET.SubElement(fa, p14).text = str(vat)
@@ -547,7 +567,7 @@ def build_ksef_xml(parsed, config):
     termin = ET.SubElement(platnosc, "TerminPlatnosci")
     ET.SubElement(termin, "Termin").text = pay_date.strftime("%Y-%m-%d")
 
-    forma = cfg_defaults.get("forma_platnosci") or pay_type_input or "6"
+    forma = pay_type_input or cfg_defaults.get("forma_platnosci") or "6"
     ET.SubElement(platnosc, "FormaPlatnosci").text = resolve_payment_type(forma)
 
     bank_nr = cfg_bank.get("nr_rb", "")
@@ -693,7 +713,29 @@ def convert_to_ksef(input_path, output_path, config=None):
 
     tree = ET.ElementTree(faktura)
     ET.indent(tree, space="\t")
-    tree.write(output_path, encoding="utf-8", xml_declaration=True)
+
+    out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xml", dir=out_dir)
+    try:
+        os.close(tmp_fd)
+        tree.write(tmp_path, encoding="utf-8", xml_declaration=True)
+
+        errors, warnings = validate_ksef_xml(tmp_path)
+        if warnings:
+            for w in warnings:
+                logger.warning("Validation warning: %s", w)
+        if errors:
+            for e in errors:
+                logger.error("Validation error: %s", e)
+            raise ValidationError(
+                f"Output has {len(errors)} validation error(s) — see log above"
+            )
+
+        shutil.move(tmp_path, output_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
     cur = config.get("defaults", {}).get("kod_waluty", "PLN")
     logger.info("Conversion complete: %s", output_path)
@@ -701,17 +743,6 @@ def convert_to_ksef(input_path, output_path, config=None):
     logger.info("  Net:   %s %s", summary["total_net"], cur)
     logger.info("  VAT:   %s %s", summary["total_vat"], cur)
     logger.info("  Gross: %s %s", summary["total_gross"], cur)
-
-    errors, warnings = validate_ksef_xml(output_path)
-    if warnings:
-        for w in warnings:
-            logger.warning("Validation warning: %s", w)
-    if errors:
-        for e in errors:
-            logger.error("Validation error: %s", e)
-        raise ValidationError(
-            f"Output has {len(errors)} validation error(s) — see log above"
-        )
 
     logger.info("Output validated OK")
     return summary

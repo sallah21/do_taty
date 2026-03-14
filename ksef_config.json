@@ -1,0 +1,40 @@
+{
+    "_comment": "KSeF Converter configuration — fill in your company details",
+    "seller_override": {
+        "nip": "1234567890",
+        "nazwa": "NAZWA FIRMY SP. Z O.O.",
+        "adres_l1": "ul. Przykladowa 1",
+        "adres_l2": "00-001 Warszawa",
+        "kod_kraju": "PL",
+        "email": "faktura@firma.pl",
+        "telefon": "+48123456789"
+    },
+    "defaults": {
+        "kod_waluty": "PLN",
+        "miejsce_wystawienia": "Warszawa",
+        "payment_days": 14,
+        "forma_platnosci": "6",
+        "system_info": "KSeFConverter v1.0"
+    },
+    "bank": {
+        "nr_rb": "12345678901234567890123456",
+        "nazwa_banku": "BANK PRZYKLADOWY S.A.",
+        "opis": ""
+    },
+    "adnotacje": {
+        "p_16": 2,
+        "p_17": 2,
+        "p_18": 2,
+        "p_18a": 2,
+        "p_23": 2
+    },
+    "vat_rate_overrides": {
+        "_comment": "Map custom rate names to numeric values, e.g. 'special': 7"
+    },
+    "dodatkowy_opis": [
+        {
+            "klucz": "Notatka",
+            "wartosc": "Przykladowy opis dodatkowy"
+        }
+    ]
+}
