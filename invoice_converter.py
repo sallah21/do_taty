@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 KSeF Invoice Converter - Production Edition
-Converts classic eform/order XML invoices to Polish KSeF FA(3) standard.
+Converts Document-Invoice XML files to Polish KSeF FA(3) standard.
 
 Usage:
     python3 invoice_converter.py input.xml output.xml
@@ -20,7 +20,7 @@ import sys
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from pathlib import Path
 
@@ -76,7 +76,7 @@ DEFAULT_CONFIG = {
         "nazwa": "",
         "adres_l1": "",
         "adres_l2": "",
-        "kod_kraju": "PL",
+        "kod_kraju": "",
         "email": "",
         "telefon": ""
     },
@@ -148,6 +148,8 @@ def detect_encoding(file_path):
         if "encoding=" in header:
             start = header.index("encoding=") + 9
             quote = header[start]
+            if quote not in ('"', "'"):
+                raise ValueError("Unquoted encoding attribute")
             end = header.index(quote, start + 1)
             declared = header[start + 1 : end].lower()
             alias = {
@@ -172,13 +174,13 @@ def detect_encoding(file_path):
 
 
 def extract_nip(tax_id):
-    """Extract clean NIP from a tax ID string (strip country prefix)."""
+    """Extract clean NIP from a tax ID string (strip country prefix and dashes)."""
     if not tax_id:
         return None
     tax_id = tax_id.strip()
     if len(tax_id) > 2 and tax_id[:2].isalpha():
-        return tax_id[2:]
-    return tax_id
+        tax_id = tax_id[2:]
+    return tax_id.replace("-", "")
 
 
 def extract_country(tax_id):
@@ -248,41 +250,177 @@ def get_ksef_vat_fields(rate):
     return ("P_13_4", "P_14_4")
 
 
+def normalize_vat_rate(rate_str, overrides=None):
+    """Normalize a VAT rate string to a Decimal matching KSEF_VAT_FIELDS keys.
+
+    '23.00' -> Decimal('23'), '8.00' -> Decimal('8'), '0.00' -> Decimal('0').
+    Named rates ('high', 'exempt') are resolved via resolve_vat_rate().
+    """
+    if not rate_str:
+        return Decimal("23")
+    try:
+        rate = Decimal(rate_str)
+        if rate == rate.to_integral_value():
+            return Decimal(str(int(rate)))
+        return rate
+    except InvalidOperation:
+        return resolve_vat_rate(rate_str, overrides)
+
+
 # ---------------------------------------------------------------------------
 # Input parsing
 # ---------------------------------------------------------------------------
 
 
 def parse_input_xml(file_path):
-    """Parse an eform/order XML file and return its main elements."""
+    """Parse a Document-Invoice XML file and return normalized invoice data."""
     encoding = detect_encoding(file_path)
     logger.info("Detected encoding: %s for %s", encoding, file_path)
 
     with open(file_path, "r", encoding=encoding, errors="replace") as f:
-        tree = ET.parse(f)
-    root = tree.getroot()
+        content = f.read()
+    # Strip BOM remnant and XML declaration to avoid double-decoding by the parser
+    content = content.lstrip("\uFEFF")
+    content = content.lstrip()
+    if content.startswith("<?xml"):
+        pos = content.find("?>")
+        if pos != -1:
+            content = content[pos + 2:].lstrip()
+        else:
+            raise ConversionError("Malformed XML declaration: missing '?>' terminator")
+    root = ET.fromstring(content)
 
-    order = root.find("order")
-    if order is None:
-        raise ConversionError(f"No <order> element found in {file_path}")
+    if root.tag != "Document-Invoice":
+        raise ConversionError(
+            f"Unsupported root element <{root.tag}>. Expected <Document-Invoice>."
+        )
 
-    document = order.find("document")
-    supplier = order.find("supplier")
-    customer = order.find("customer")
-    items = order.findall("orderItem")
-    payment = order.find("payment")
+    header = root.find("Invoice-Header")
+    parties = root.find("Invoice-Parties")
+    lines_el = root.find("Invoice-Lines")
+    summary_el = root.find("Invoice-Summary")
 
-    if document is None:
-        raise ConversionError("Missing <document> element")
+    if header is None:
+        raise ConversionError("Missing <Invoice-Header>")
+    if parties is None:
+        raise ConversionError("Missing <Invoice-Parties>")
+    if lines_el is None:
+        raise ConversionError("Missing <Invoice-Lines>")
+
+    # --- Header ---
+    doc_number = get_text(header, "InvoiceNumber")
+    doc_date = get_text(header, "InvoiceDate")
+    sales_date = get_text(header, "SalesDate") or doc_date
+    currency = get_text(header, "InvoiceCurrency") or "PLN"
+    payment_due_date = get_text(header, "InvoicePaymentDueDate")
+
+    if not doc_number:
+        raise ConversionError("InvoiceNumber is required")
+    if not doc_date:
+        raise ConversionError("InvoiceDate is required")
+
+    # --- Parties ---
+    seller_el = parties.find("Seller")
+    buyer_el = parties.find("Buyer")
+    payee_el = parties.find("Payee")
+
+    if seller_el is None:
+        raise ConversionError("Missing <Seller> in Invoice-Parties")
+    if buyer_el is None:
+        raise ConversionError("Missing <Buyer> in Invoice-Parties")
+
+    def parse_party(el):
+        return {
+            "tax_id": get_text(el, "TaxID"),
+            "name": get_text(el, "Name"),
+            "street": get_text(el, "StreetAndNumber"),
+            "city": get_text(el, "CityName"),
+            "postal_code": get_text(el, "PostalCode"),
+            "country": get_text(el, "Country"),
+        }
+
+    seller = parse_party(seller_el)
+    buyer = parse_party(buyer_el)
+    bank_account = get_text(payee_el, "AccountNumber") if payee_el is not None else ""
+
+    # --- Line Items ---
+    items = []
+    for line in lines_el.findall("Line"):
+        li = line.find("Line-Item")
+        if li is None:
+            continue
+        items.append({
+            "line_number": get_text(li, "LineNumber"),
+            "ean": get_text(li, "EAN"),
+            "description": get_text(li, "ItemDescription"),
+            "quantity": get_text(li, "InvoiceQuantity"),
+            "unit": get_text(li, "UnitOfMeasure") or "szt",
+            "unit_price": get_text(li, "InvoiceUnitNetPrice"),
+            "tax_rate": get_text(li, "TaxRate"),
+            "tax_amount": get_text(li, "TaxAmount"),
+            "net_amount": get_text(li, "NetAmount"),
+        })
+
     if not items:
-        raise ConversionError("No <orderItem> elements found")
+        raise ConversionError("No line items found in <Invoice-Lines>")
+
+    for idx, item in enumerate(items, 1):
+        desc = item.get("description", "?") or "?"
+        if not item.get("net_amount"):
+            raise ConversionError(
+                f"Missing NetAmount on line item {idx}: '{desc}'"
+            )
+        if not item.get("quantity"):
+            raise ConversionError(
+                f"Missing InvoiceQuantity on line item {idx}: '{desc}'"
+            )
+        if not item.get("unit_price"):
+            raise ConversionError(
+                f"Missing InvoiceUnitNetPrice on line item {idx}: '{desc}'"
+            )
+        if not item.get("tax_amount"):
+            raise ConversionError(
+                f"Missing TaxAmount on line item {idx}: '{desc}'"
+            )
+
+    # --- Summary ---
+    sum_data = None
+    if summary_el is not None:
+        tax_lines = []
+        ts = summary_el.find("Tax-Summary")
+        if ts is not None:
+            for tsl in ts.findall("Tax-Summary-Line"):
+                rate = get_text(tsl, "TaxRate")
+                tax_amt = get_text(tsl, "TaxAmount")
+                taxable_amt = get_text(tsl, "TaxableAmount")
+                if not tax_amt or not taxable_amt:
+                    raise ConversionError(
+                        f"Incomplete Tax-Summary-Line (rate={rate!r}): "
+                        f"TaxAmount={tax_amt!r}, TaxableAmount={taxable_amt!r}"
+                    )
+                tax_lines.append({
+                    "rate": rate,
+                    "tax_amount": tax_amt,
+                    "taxable_amount": taxable_amt,
+                })
+        sum_data = {
+            "total_net": get_text(summary_el, "TotalNetAmount"),
+            "total_tax": get_text(summary_el, "TotalTaxAmount"),
+            "total_gross": get_text(summary_el, "TotalGrossAmount"),
+            "tax_lines": tax_lines,
+        }
 
     return {
-        "document": document,
-        "supplier": supplier,
-        "customer": customer,
+        "doc_number": doc_number,
+        "doc_date": doc_date,
+        "sales_date": sales_date,
+        "currency": currency,
+        "payment_due_date": payment_due_date,
+        "seller": seller,
+        "buyer": buyer,
+        "bank_account": bank_account,
         "items": items,
-        "payment": payment,
+        "summary": sum_data,
     }
 
 
@@ -292,25 +430,24 @@ def parse_input_xml(file_path):
 
 
 def build_ksef_xml(parsed, config):
-    """Build a complete KSeF FA(3) XML tree from parsed input and config."""
-    doc = parsed["document"]
-    supplier = parsed["supplier"]
-    customer = parsed["customer"]
-    items = parsed["items"]
-    payment = parsed["payment"]
-
+    """Build a complete KSeF FA(3) XML tree from parsed invoice data and config."""
     cfg_seller = config.get("seller_override", {})
     cfg_defaults = config.get("defaults", {})
     cfg_bank = config.get("bank", {})
     cfg_adnotacje = config.get("adnotacje", {})
-    cfg_vat = config.get("vat_rate_overrides", {})
+    cfg_vat = {k: v for k, v in config.get("vat_rate_overrides", {}).items()
+               if not k.startswith("_")}
 
-    doc_number = get_attr(doc, "number")
-    doc_date = get_attr(doc, "date")
-    if not doc_date:
-        raise ConversionError("Document date is required")
-    if not doc_number:
-        raise ConversionError("Document number is required")
+    doc_number = parsed["doc_number"]
+    doc_date = parsed["doc_date"]
+    sales_date = parsed["sales_date"]
+    currency = parsed.get("currency") or cfg_defaults.get("kod_waluty", "PLN")
+    seller = parsed["seller"]
+    buyer = parsed["buyer"]
+    items = parsed["items"]
+    src_summary = parsed.get("summary")
+    bank_account = parsed.get("bank_account", "")
+    payment_due_date = parsed.get("payment_due_date", "")
 
     # --- Root ---
     ET.register_namespace("", KSEF_NAMESPACE)
@@ -325,7 +462,7 @@ def build_ksef_xml(parsed, config):
     kf.text = FORM_CODE
     ET.SubElement(naglowek, "WariantFormularza").text = FORM_VARIANT
     ET.SubElement(naglowek, "DataWytworzeniaFa").text = (
-        datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     )
     ET.SubElement(naglowek, "SystemInfo").text = cfg_defaults.get(
         "system_info", "KSeFConverter v1.0"
@@ -335,31 +472,31 @@ def build_ksef_xml(parsed, config):
     podmiot1 = ET.SubElement(faktura, "Podmiot1")
     dane1 = ET.SubElement(podmiot1, "DaneIdentyfikacyjne")
 
-    seller_nip = (
-        cfg_seller.get("nip") or extract_nip(get_text(supplier, "dic"))
-    )
-    seller_name = cfg_seller.get("nazwa") or get_text(supplier, "company")
+    seller_nip = cfg_seller.get("nip") or extract_nip(seller["tax_id"])
+    seller_name = cfg_seller.get("nazwa") or seller["name"]
     if not seller_nip:
         raise ConversionError(
-            "Seller NIP is required — set it in config or ensure input XML has <dic>"
+            "Seller NIP is required — set it in config or ensure input has <TaxID>"
         )
 
     ET.SubElement(dane1, "NIP").text = seller_nip
     ET.SubElement(dane1, "Nazwa").text = seller_name
 
     adres1 = ET.SubElement(podmiot1, "Adres")
-    seller_country = (
-        cfg_seller.get("kod_kraju")
-        or extract_country(get_text(supplier, "dic"))
-        or "PL"
-    )
+    seller_country = cfg_seller.get("kod_kraju") or ""
+    if not seller_country:
+        seller_country = (
+            extract_country(seller["tax_id"])
+            if seller["tax_id"] and seller["tax_id"][:2].isalpha()
+            else seller.get("country") or "PL"
+        )
     ET.SubElement(adres1, "KodKraju").text = seller_country
 
-    a1_l1 = cfg_seller.get("adres_l1") or get_text(supplier, "street")
+    a1_l1 = cfg_seller.get("adres_l1") or seller.get("street", "")
     a1_l2 = cfg_seller.get("adres_l2")
     if not a1_l2:
-        psc = get_text(supplier, "psc")
-        city = get_text(supplier, "city")
+        psc = seller.get("postal_code", "")
+        city = seller.get("city", "")
         if psc or city:
             a1_l2 = f"{psc} {city}".strip()
     if a1_l1:
@@ -367,8 +504,8 @@ def build_ksef_xml(parsed, config):
     if a1_l2:
         ET.SubElement(adres1, "AdresL2").text = a1_l2
 
-    seller_email = cfg_seller.get("email") or get_text(supplier, "email")
-    seller_phone = cfg_seller.get("telefon") or get_text(supplier, "tel")
+    seller_email = cfg_seller.get("email")
+    seller_phone = cfg_seller.get("telefon")
     if seller_email or seller_phone:
         kontakt1 = ET.SubElement(podmiot1, "DaneKontaktowe")
         if seller_email:
@@ -380,12 +517,15 @@ def build_ksef_xml(parsed, config):
     podmiot2 = ET.SubElement(faktura, "Podmiot2")
     dane2 = ET.SubElement(podmiot2, "DaneIdentyfikacyjne")
 
-    buyer_dic = get_text(customer, "dic")
-    buyer_nip = extract_nip(buyer_dic)
-    buyer_country = extract_country(buyer_dic) if buyer_dic else "PL"
-    buyer_name = get_text(customer, "company")
+    buyer_nip = extract_nip(buyer["tax_id"])
+    buyer_country = (
+        extract_country(buyer["tax_id"])
+        if buyer["tax_id"] and buyer["tax_id"][:2].isalpha()
+        else buyer.get("country") or "PL"
+    )
+    buyer_name = buyer["name"]
     if not buyer_nip:
-        raise ConversionError("Buyer NIP / tax ID is required in input XML <dic>")
+        raise ConversionError("Buyer NIP / tax ID is required in input <TaxID>")
 
     if buyer_country == "PL":
         ET.SubElement(dane2, "NIP").text = buyer_nip
@@ -397,29 +537,19 @@ def build_ksef_xml(parsed, config):
 
     adres2 = ET.SubElement(podmiot2, "Adres")
     ET.SubElement(adres2, "KodKraju").text = buyer_country
-    buyer_street = get_text(customer, "street")
-    buyer_psc = get_text(customer, "psc")
-    buyer_city = get_text(customer, "city")
+    buyer_street = buyer.get("street", "")
+    buyer_psc = buyer.get("postal_code", "")
+    buyer_city = buyer.get("city", "")
     if buyer_street:
         ET.SubElement(adres2, "AdresL1").text = buyer_street
     if buyer_psc or buyer_city:
         ET.SubElement(adres2, "AdresL2").text = f"{buyer_psc} {buyer_city}".strip()
-
-    buyer_email = get_text(customer, "email")
-    buyer_phone = get_text(customer, "tel")
-    if buyer_email or buyer_phone:
-        kontakt2 = ET.SubElement(podmiot2, "DaneKontaktowe")
-        if buyer_email:
-            ET.SubElement(kontakt2, "Email").text = buyer_email
-        if buyer_phone:
-            ET.SubElement(kontakt2, "Telefon").text = buyer_phone
 
     ET.SubElement(podmiot2, "JST").text = "2"
     ET.SubElement(podmiot2, "GV").text = "2"
 
     # --- Fa ---
     fa = ET.SubElement(faktura, "Fa")
-    currency = cfg_defaults.get("kod_waluty", "PLN")
     ET.SubElement(fa, "KodWaluty").text = currency
     ET.SubElement(fa, "P_1").text = doc_date
 
@@ -428,84 +558,88 @@ def build_ksef_xml(parsed, config):
         ET.SubElement(fa, "P_1M").text = place
 
     ET.SubElement(fa, "P_2").text = doc_number
-    ET.SubElement(fa, "P_6").text = doc_date
+    ET.SubElement(fa, "P_6").text = sales_date
 
-    # --- Calculate VAT buckets per rate ---
-    vat_buckets = {}
-    line_data = []
+    # --- VAT totals from Tax-Summary or calculated from line items ---
+    total_net = Decimal("0")
+    total_vat = Decimal("0")
     has_exempt = False
 
-    for item in items:
-        price_str = get_attr(item, "price")
-        qty_str = get_attr(item, "quantity")
-        if not price_str:
-            desc = (item.text or "").strip()
-            raise ConversionError(
-                f"Missing 'price' attribute on orderItem '{desc}'"
+    # Collect per-rate buckets, then merge by KSeF field pair to avoid duplicates
+    rate_buckets = {}
+
+    if src_summary and src_summary.get("tax_lines"):
+        for tl in src_summary["tax_lines"]:
+            rate = normalize_vat_rate(tl["rate"], cfg_vat)
+            net = money(tl["taxable_amount"])
+            vat = money(tl["tax_amount"])
+            if rate is None:
+                has_exempt = True
+            bucket = rate_buckets.setdefault(
+                rate, {"net": Decimal("0"), "vat": Decimal("0")}
             )
-        if not qty_str:
-            desc = (item.text or "").strip()
-            raise ConversionError(
-                f"Missing 'quantity' attribute on orderItem '{desc}'"
+            bucket["net"] += net
+            bucket["vat"] += vat
+    else:
+        for item in items:
+            rate = normalize_vat_rate(item["tax_rate"], cfg_vat)
+            net = money(item["net_amount"])
+            vat = money(item["tax_amount"])
+            if rate is None:
+                has_exempt = True
+            bucket = rate_buckets.setdefault(
+                rate, {"net": Decimal("0"), "vat": Decimal("0")}
             )
-        price = money(price_str)
-        quantity = Decimal(qty_str)
-        rate_str = get_attr(item, "rateVAT", "high")
-        vat_rate = resolve_vat_rate(rate_str, cfg_vat)
+            bucket["net"] += net
+            bucket["vat"] += vat
 
-        net_value = money(price * quantity)
-
-        if vat_rate is not None:
-            vat_value = money(net_value * vat_rate / Decimal("100"))
-            ksef_rate_display = str(int(vat_rate)) if vat_rate == int(vat_rate) else str(vat_rate)
-        else:
-            vat_value = money(0)
-            ksef_rate_display = "zw"
-            has_exempt = True
-
-        bucket = vat_buckets.setdefault(vat_rate, {"net": Decimal("0"), "vat": Decimal("0")})
-        bucket["net"] += net_value
-        bucket["vat"] += vat_value
-
-        line_data.append({
-            "description": (item.text or "").strip(),
-            "unit": get_attr(item, "unit", "szt"),
-            "quantity": qty_str,
-            "price": str(price),
-            "net_value": str(net_value),
-            "vat_rate_display": ksef_rate_display,
-            "date": get_attr(item, "date") or doc_date,
-            "ean": get_attr(item, "EAN"),
-            "code": get_attr(item, "code"),
-            "remark": get_attr(item, "remark").strip(),
-        })
-
-    # Merge VAT buckets by KSeF field pair to avoid duplicate P_13_x/P_14_x
+    # Merge by KSeF field pair to prevent duplicate P_13_x/P_14_x elements
     field_buckets = {}
-    for rate, bucket in vat_buckets.items():
+    for rate, bucket in rate_buckets.items():
         p13, p14 = get_ksef_vat_fields(rate)
-        fb = field_buckets.setdefault((p13, p14), {"net": Decimal("0"), "vat": Decimal("0")})
+        fb = field_buckets.setdefault(
+            (p13, p14), {"net": Decimal("0"), "vat": Decimal("0")}
+        )
         fb["net"] += bucket["net"]
         fb["vat"] += bucket["vat"]
 
-    # Write P_13_x / P_14_x fields — sorted: 23%, 8%, 5%, special, 0%, exempt
-    field_sort_key = lambda k: k[0]
-    total_net = Decimal("0")
-    total_vat = Decimal("0")
-
-    for (p13, p14) in sorted(field_buckets, key=field_sort_key):
+    for (p13, p14) in sorted(field_buckets):
         fb = field_buckets[(p13, p14)]
         net = money(fb["net"])
         vat = money(fb["vat"])
         total_net += net
         total_vat += vat
-
         ET.SubElement(fa, p13).text = str(net)
         if p14 and vat > 0:
             ET.SubElement(fa, p14).text = str(vat)
 
     total_gross = money(total_net + total_vat)
     ET.SubElement(fa, "P_15").text = str(total_gross)
+
+    if src_summary and src_summary.get("total_gross"):
+        expected = money(src_summary["total_gross"])
+        if expected != total_gross:
+            raise ConversionError(
+                f"Gross total mismatch: calculated {total_gross} vs "
+                f"source summary {expected}"
+            )
+
+    # Per-rate consistency check: verify line-item sums match Tax-Summary
+    if src_summary and src_summary.get("tax_lines"):
+        line_rate_totals = {}
+        for item in items:
+            rate = normalize_vat_rate(item["tax_rate"], cfg_vat)
+            bucket = line_rate_totals.setdefault(rate, Decimal("0"))
+            line_rate_totals[rate] += money(item["net_amount"])
+        for tl in src_summary["tax_lines"]:
+            rate = normalize_vat_rate(tl["rate"], cfg_vat)
+            summary_net = money(tl["taxable_amount"])
+            line_net = line_rate_totals.get(rate, Decimal("0"))
+            if summary_net != line_net:
+                logger.warning(
+                    "Rate %s%%: Tax-Summary net %s != sum of line items net %s",
+                    rate, summary_net, line_net,
+                )
 
     # --- Adnotacje ---
     adnotacje = ET.SubElement(fa, "Adnotacje")
@@ -523,7 +657,14 @@ def build_ksef_xml(parsed, config):
     ET.SubElement(adnotacje, "P_18A").text = str(p_18a)
 
     zwolnienie = ET.SubElement(adnotacje, "Zwolnienie")
-    ET.SubElement(zwolnienie, "P_19N").text = "1" if not has_exempt else "2"
+    if has_exempt:
+        p19 = ET.SubElement(zwolnienie, "P_19")
+        p19_basis = cfg_adnotacje.get(
+            "p_19_basis", "Zwolnione z VAT na podstawie art. 43 ust. 1 ustawy o VAT"
+        )
+        ET.SubElement(p19, "P_19A").text = p19_basis
+    else:
+        ET.SubElement(zwolnienie, "P_19N").text = "1"
 
     nowe_srodki = ET.SubElement(adnotacje, "NoweSrodkiTransportu")
     ET.SubElement(nowe_srodki, "P_22N").text = "1"
@@ -541,36 +682,52 @@ def build_ksef_xml(parsed, config):
         ET.SubElement(do, "Wartosc").text = opis.get("wartosc", "")
 
     # --- FaWiersz ---
-    for idx, ld in enumerate(line_data, 1):
+    for idx, item in enumerate(items, 1):
         fw = ET.SubElement(fa, "FaWiersz")
         ET.SubElement(fw, "NrWierszaFa").text = str(idx)
         ET.SubElement(fw, "UU_ID").text = str(uuid.uuid4()).replace("-", "")[:32]
-        ET.SubElement(fw, "P_6A").text = ld["date"]
-        ET.SubElement(fw, "P_7").text = ld["description"]
-        ET.SubElement(fw, "P_8A").text = ld["unit"]
-        ET.SubElement(fw, "P_8B").text = ld["quantity"]
-        ET.SubElement(fw, "P_9A").text = ld["price"]
-        ET.SubElement(fw, "P_11").text = ld["net_value"]
-        ET.SubElement(fw, "P_12").text = ld["vat_rate_display"]
+        ET.SubElement(fw, "P_6A").text = sales_date
+        ET.SubElement(fw, "P_7").text = item["description"]
+        ET.SubElement(fw, "P_8A").text = item.get("unit", "szt")
+        ET.SubElement(fw, "P_8B").text = item["quantity"]
+        ET.SubElement(fw, "P_9A").text = str(money(item["unit_price"]))
+        ET.SubElement(fw, "P_11").text = str(money(item["net_amount"]))
+        rate = normalize_vat_rate(item["tax_rate"], cfg_vat)
+        if rate is not None:
+            rate_display = str(int(rate)) if rate == int(rate) else str(rate)
+        else:
+            rate_display = "zw"
+        ET.SubElement(fw, "P_12").text = rate_display
 
     # --- Platnosc ---
     platnosc = ET.SubElement(fa, "Platnosc")
 
-    pay_type_input = get_attr(payment, "payType", "") if payment is not None else ""
-    payment_days = cfg_defaults.get("payment_days", 14)
+    if payment_due_date:
+        try:
+            datetime.strptime(payment_due_date, "%Y-%m-%d")
+        except ValueError:
+            raise ConversionError(
+                f"Invalid InvoicePaymentDueDate format: {payment_due_date!r} "
+                f"(expected YYYY-MM-DD)"
+            )
+        termin = ET.SubElement(platnosc, "TerminPlatnosci")
+        ET.SubElement(termin, "Termin").text = payment_due_date
+    else:
+        payment_days = int(cfg_defaults.get("payment_days", 14))
+        try:
+            pay_date = datetime.strptime(doc_date, "%Y-%m-%d") + timedelta(
+                days=payment_days
+            )
+        except ValueError as e:
+            raise ConversionError(f"Invalid date format: {doc_date}") from e
+        termin = ET.SubElement(platnosc, "TerminPlatnosci")
+        ET.SubElement(termin, "Termin").text = pay_date.strftime("%Y-%m-%d")
 
-    try:
-        pay_date = datetime.strptime(doc_date, "%Y-%m-%d") + timedelta(days=payment_days)
-    except ValueError as e:
-        raise ConversionError(f"Invalid document date format: {doc_date}") from e
+    ET.SubElement(platnosc, "FormaPlatnosci").text = resolve_payment_type(
+        cfg_defaults.get("forma_platnosci", "6")
+    )
 
-    termin = ET.SubElement(platnosc, "TerminPlatnosci")
-    ET.SubElement(termin, "Termin").text = pay_date.strftime("%Y-%m-%d")
-
-    forma = pay_type_input or cfg_defaults.get("forma_platnosci") or "6"
-    ET.SubElement(platnosc, "FormaPlatnosci").text = resolve_payment_type(forma)
-
-    bank_nr = cfg_bank.get("nr_rb", "")
+    bank_nr = cfg_bank.get("nr_rb") or bank_account
     bank_name = cfg_bank.get("nazwa_banku", "")
     if bank_nr:
         rb = ET.SubElement(platnosc, "RachunekBankowy")
@@ -581,17 +738,14 @@ def build_ksef_xml(parsed, config):
         if bank_desc:
             ET.SubElement(rb, "OpisRachunku").text = bank_desc
 
-    summary = {
+    result = {
         "total_net": total_net,
         "total_vat": total_vat,
         "total_gross": total_gross,
-        "line_count": len(line_data),
-        "vat_buckets": {
-            str(k): {"net": str(money(v["net"])), "vat": str(money(v["vat"]))}
-            for k, v in vat_buckets.items()
-        },
+        "line_count": len(items),
+        "currency": currency,
     }
-    return faktura, summary
+    return faktura, result
 
 
 # ---------------------------------------------------------------------------
@@ -704,7 +858,7 @@ def validate_ksef_xml(file_path):
 def convert_to_ksef(input_path, output_path, config=None):
     """Parse input, build KSeF XML, write to file, return summary."""
     if config is None:
-        config = DEFAULT_CONFIG.copy()
+        config = json.loads(json.dumps(DEFAULT_CONFIG))
 
     logger.info("Converting: %s -> %s", input_path, output_path)
 
@@ -737,7 +891,7 @@ def convert_to_ksef(input_path, output_path, config=None):
             os.remove(tmp_path)
         raise
 
-    cur = config.get("defaults", {}).get("kod_waluty", "PLN")
+    cur = summary.get("currency", config.get("defaults", {}).get("kod_waluty", "PLN"))
     logger.info("Conversion complete: %s", output_path)
     logger.info("  Lines: %d", summary["line_count"])
     logger.info("  Net:   %s %s", summary["total_net"], cur)
@@ -863,7 +1017,7 @@ def batch_convert(input_dir, output_dir, config):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="KSeF Invoice Converter — eform/order XML → KSeF FA(3)",
+        description="KSeF Invoice Converter — Document-Invoice XML → KSeF FA(3)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
