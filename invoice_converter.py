@@ -48,7 +48,7 @@ KSEF_VAT_FIELDS = {
     Decimal("23"): ("P_13_1", "P_14_1"),
     Decimal("8"):  ("P_13_2", "P_14_2"),
     Decimal("5"):  ("P_13_3", "P_14_3"),
-    Decimal("0"):  ("P_13_6", None),
+    Decimal("0"):  ("P_13_6_1", None),
     None:          ("P_13_7", None),
 }
 
@@ -63,6 +63,21 @@ PAYMENT_TYPE_MAP = {
 }
 
 SPLIT_PAYMENT_THRESHOLD = Decimal("15000")
+
+# EDI DocumentFunctionCode → KSeF RodzajFaktury mapping
+DOC_FUNCTION_MAP = {
+    "O": "VAT",      # Original
+    "R": "VAT",      # Duplicate / reprint
+    "C": "KOR",      # Correction
+    "D": "KOR",      # Debit note (correction)
+    "31": "KOR",     # Credit note / correction (UN/EDIFACT)
+    "383": "KOR",    # Credit note (UN/EDIFACT)
+    "380": "VAT",    # Commercial invoice (UN/EDIFACT)
+    "386": "ZAL",    # Prepayment / advance
+}
+
+# EDI TaxCategoryCode values that indicate VAT exemption
+EXEMPT_TAX_CATEGORIES = {"E", "AE"}
 
 logger = logging.getLogger("ksef_converter")
 
@@ -250,12 +265,15 @@ def get_ksef_vat_fields(rate):
     return ("P_13_4", "P_14_4")
 
 
-def normalize_vat_rate(rate_str, overrides=None):
+def normalize_vat_rate(rate_str, overrides=None, tax_category_code=None):
     """Normalize a VAT rate string to a Decimal matching KSEF_VAT_FIELDS keys.
 
     '23.00' -> Decimal('23'), '8.00' -> Decimal('8'), '0.00' -> Decimal('0').
     Named rates ('high', 'exempt') are resolved via resolve_vat_rate().
+    If tax_category_code indicates exemption (E, AE), returns None regardless of rate.
     """
+    if tax_category_code and tax_category_code.upper() in EXEMPT_TAX_CATEGORIES:
+        return None
     if not rate_str:
         return Decimal("23")
     try:
@@ -313,6 +331,33 @@ def parse_input_xml(file_path):
     sales_date = get_text(header, "SalesDate") or doc_date
     currency = get_text(header, "InvoiceCurrency") or "PLN"
     payment_due_date = get_text(header, "InvoicePaymentDueDate")
+    doc_function_code = get_text(header, "DocumentFunctionCode")
+
+    # Order info
+    order_el = header.find("Order")
+    order_number = get_text(order_el, "BuyerOrderNumber") if order_el is not None else ""
+    order_date = get_text(order_el, "BuyerOrderDate") if order_el is not None else ""
+
+    # Reference (e.g. for corrective invoices)
+    ref_el = header.find("Reference")
+    invoice_ref_number = get_text(ref_el, "InvoiceReferenceNumber") if ref_el is not None else ""
+    invoice_ref_ksef_number = get_text(ref_el, "InvoiceReferenceKSeFNumber") if ref_el is not None else ""
+    invoice_ref_date = get_text(ref_el, "InvoiceReferenceDate") if ref_el is not None else ""
+
+    # Delivery info
+    delivery_el = header.find("Delivery")
+    delivery = None
+    if delivery_el is not None:
+        delivery = {
+            "location_number": get_text(delivery_el, "DeliveryLocationNumber"),
+            "date": get_text(delivery_el, "DeliveryDate"),
+            "despatch_number": get_text(delivery_el, "DespatchNumber"),
+            "name": get_text(delivery_el, "Name"),
+            "street": get_text(delivery_el, "StreetAndNumber"),
+            "city": get_text(delivery_el, "CityName"),
+            "postal_code": get_text(delivery_el, "PostalCode"),
+            "country": get_text(delivery_el, "Country"),
+        }
 
     if not doc_number:
         raise ConversionError("InvoiceNumber is required")
@@ -331,6 +376,7 @@ def parse_input_xml(file_path):
 
     def parse_party(el):
         return {
+            "iln": get_text(el, "ILN"),
             "tax_id": get_text(el, "TaxID"),
             "name": get_text(el, "Name"),
             "street": get_text(el, "StreetAndNumber"),
@@ -352,11 +398,13 @@ def parse_input_xml(file_path):
         items.append({
             "line_number": get_text(li, "LineNumber"),
             "ean": get_text(li, "EAN"),
+            "item_code": get_text(li, "ItemCode"),
             "description": get_text(li, "ItemDescription"),
             "quantity": get_text(li, "InvoiceQuantity"),
             "unit": get_text(li, "UnitOfMeasure") or "szt",
             "unit_price": get_text(li, "InvoiceUnitNetPrice"),
             "tax_rate": get_text(li, "TaxRate"),
+            "tax_category_code": get_text(li, "TaxCategoryCode"),
             "tax_amount": get_text(li, "TaxAmount"),
             "net_amount": get_text(li, "NetAmount"),
         })
@@ -393,6 +441,7 @@ def parse_input_xml(file_path):
                 rate = get_text(tsl, "TaxRate")
                 tax_amt = get_text(tsl, "TaxAmount")
                 taxable_amt = get_text(tsl, "TaxableAmount")
+                tcc = get_text(tsl, "TaxCategoryCode")
                 if not tax_amt or not taxable_amt:
                     raise ConversionError(
                         f"Incomplete Tax-Summary-Line (rate={rate!r}): "
@@ -400,6 +449,7 @@ def parse_input_xml(file_path):
                     )
                 tax_lines.append({
                     "rate": rate,
+                    "tax_category_code": tcc,
                     "tax_amount": tax_amt,
                     "taxable_amount": taxable_amt,
                 })
@@ -416,6 +466,13 @@ def parse_input_xml(file_path):
         "sales_date": sales_date,
         "currency": currency,
         "payment_due_date": payment_due_date,
+        "doc_function_code": doc_function_code,
+        "order_number": order_number,
+        "order_date": order_date,
+        "invoice_ref_number": invoice_ref_number,
+        "invoice_ref_ksef_number": invoice_ref_ksef_number,
+        "invoice_ref_date": invoice_ref_date,
+        "delivery": delivery,
         "seller": seller,
         "buyer": buyer,
         "bank_account": bank_account,
@@ -448,6 +505,20 @@ def build_ksef_xml(parsed, config):
     src_summary = parsed.get("summary")
     bank_account = parsed.get("bank_account", "")
     payment_due_date = parsed.get("payment_due_date", "")
+    order_number = parsed.get("order_number", "")
+    order_date = parsed.get("order_date", "")
+    delivery = parsed.get("delivery")
+    doc_function_code = parsed.get("doc_function_code", "")
+    invoice_ref_number = parsed.get("invoice_ref_number", "")
+    invoice_ref_ksef_number = parsed.get("invoice_ref_ksef_number", "")
+    invoice_ref_date = parsed.get("invoice_ref_date", "")
+    rodzaj_faktury = DOC_FUNCTION_MAP.get(doc_function_code, "VAT")
+
+    if rodzaj_faktury in ("KOR", "KOR_ZAL", "KOR_ROZ") and not invoice_ref_number:
+        raise ConversionError(
+            f"Correction invoice (RodzajFaktury={rodzaj_faktury}) requires "
+            f"InvoiceReferenceNumber in <Reference> but none was found"
+        )
 
     # --- Root ---
     ET.register_namespace("", KSEF_NAMESPACE)
@@ -565,12 +636,30 @@ def build_ksef_xml(parsed, config):
     total_vat = Decimal("0")
     has_exempt = False
 
+    # Build rate→tax_category_code map from summary for consistent bucketing
+    summary_tcc_map = {}
+    if src_summary and src_summary.get("tax_lines"):
+        for tl in src_summary["tax_lines"]:
+            raw_rate = tl.get("rate", "")
+            tcc = tl.get("tax_category_code", "")
+            if raw_rate and tcc:
+                summary_tcc_map[raw_rate] = tcc
+
+    def resolve_tcc(item_or_tl):
+        """Return tax_category_code: prefer own, fall back to summary map."""
+        tcc = item_or_tl.get("tax_category_code", "")
+        if not tcc:
+            tcc = summary_tcc_map.get(item_or_tl.get("rate") or item_or_tl.get("tax_rate", ""), "")
+        return tcc
+
     # Collect per-rate buckets, then merge by KSeF field pair to avoid duplicates
     rate_buckets = {}
 
     if src_summary and src_summary.get("tax_lines"):
         for tl in src_summary["tax_lines"]:
-            rate = normalize_vat_rate(tl["rate"], cfg_vat)
+            rate = normalize_vat_rate(
+                tl["rate"], cfg_vat, resolve_tcc(tl)
+            )
             net = money(tl["taxable_amount"])
             vat = money(tl["tax_amount"])
             if rate is None:
@@ -582,7 +671,9 @@ def build_ksef_xml(parsed, config):
             bucket["vat"] += vat
     else:
         for item in items:
-            rate = normalize_vat_rate(item["tax_rate"], cfg_vat)
+            rate = normalize_vat_rate(
+                item["tax_rate"], cfg_vat, resolve_tcc(item)
+            )
             net = money(item["net_amount"])
             vat = money(item["tax_amount"])
             if rate is None:
@@ -628,11 +719,15 @@ def build_ksef_xml(parsed, config):
     if src_summary and src_summary.get("tax_lines"):
         line_rate_totals = {}
         for item in items:
-            rate = normalize_vat_rate(item["tax_rate"], cfg_vat)
+            rate = normalize_vat_rate(
+                item["tax_rate"], cfg_vat, resolve_tcc(item)
+            )
             bucket = line_rate_totals.setdefault(rate, Decimal("0"))
             line_rate_totals[rate] += money(item["net_amount"])
         for tl in src_summary["tax_lines"]:
-            rate = normalize_vat_rate(tl["rate"], cfg_vat)
+            rate = normalize_vat_rate(
+                tl["rate"], cfg_vat, resolve_tcc(tl)
+            )
             summary_net = money(tl["taxable_amount"])
             line_net = line_rate_totals.get(rate, Decimal("0"))
             if summary_net != line_net:
@@ -673,7 +768,20 @@ def build_ksef_xml(parsed, config):
     ET.SubElement(pmarzy, "P_PMarzyN").text = "1"
 
     # --- RodzajFaktury ---
-    ET.SubElement(fa, "RodzajFaktury").text = "VAT"
+    ET.SubElement(fa, "RodzajFaktury").text = rodzaj_faktury
+
+    # --- Correction reference (for KOR invoices) ---
+    if rodzaj_faktury in ("KOR", "KOR_ZAL", "KOR_ROZ") and invoice_ref_number:
+        dane_kor = ET.SubElement(fa, "DaneFaKorygowanej")
+        ET.SubElement(dane_kor, "DataWystFaKorygowanej").text = (
+            invoice_ref_date or doc_date
+        )
+        ET.SubElement(dane_kor, "NrFaKorygowanej").text = invoice_ref_number
+        if invoice_ref_ksef_number:
+            ET.SubElement(dane_kor, "NrKSeF").text = "1"
+            ET.SubElement(dane_kor, "NrKSeFFaKorygowanej").text = invoice_ref_ksef_number
+        else:
+            ET.SubElement(dane_kor, "NrKSeFN").text = "1"
 
     # --- DodatkowyOpis ---
     for opis in config.get("dodatkowy_opis", []):
@@ -681,18 +789,72 @@ def build_ksef_xml(parsed, config):
         ET.SubElement(do, "Klucz").text = opis.get("klucz", "Notatka")
         ET.SubElement(do, "Wartosc").text = opis.get("wartosc", "")
 
+    # Order number/date as DodatkowyOpis (also emitted in WarunkiTransakcji below)
+    if order_number:
+        do = ET.SubElement(fa, "DodatkowyOpis")
+        ET.SubElement(do, "Klucz").text = "NrZamowienia"
+        ET.SubElement(do, "Wartosc").text = order_number
+    if order_date:
+        do = ET.SubElement(fa, "DodatkowyOpis")
+        ET.SubElement(do, "Klucz").text = "DataZamowienia"
+        ET.SubElement(do, "Wartosc").text = order_date
+
+    # Buyer GLN (ILN) as DodatkowyOpis
+    buyer_iln = buyer.get("iln", "")
+    if buyer_iln:
+        do = ET.SubElement(fa, "DodatkowyOpis")
+        ET.SubElement(do, "Klucz").text = "GLN_Nabywcy"
+        ET.SubElement(do, "Wartosc").text = buyer_iln
+
+    # Seller GLN (ILN) as DodatkowyOpis
+    seller_iln = seller.get("iln", "")
+    if seller_iln:
+        do = ET.SubElement(fa, "DodatkowyOpis")
+        ET.SubElement(do, "Klucz").text = "GLN_Sprzedawcy"
+        ET.SubElement(do, "Wartosc").text = seller_iln
+
+    # Delivery info as DodatkowyOpis
+    if delivery:
+        dlv_name = delivery.get("name", "")
+        if dlv_name:
+            do = ET.SubElement(fa, "DodatkowyOpis")
+            ET.SubElement(do, "Klucz").text = "MiejsceDostawy"
+            dlv_parts = [dlv_name]
+            dlv_street = delivery.get("street", "")
+            dlv_psc = delivery.get("postal_code", "")
+            dlv_city = delivery.get("city", "")
+            if dlv_street:
+                dlv_parts.append(dlv_street)
+            if dlv_psc or dlv_city:
+                dlv_parts.append(f"{dlv_psc} {dlv_city}".strip())
+            ET.SubElement(do, "Wartosc").text = ", ".join(dlv_parts)
+        dlv_despatch = delivery.get("despatch_number", "")
+        if dlv_despatch:
+            do = ET.SubElement(fa, "DodatkowyOpis")
+            ET.SubElement(do, "Klucz").text = "NrWZ"
+            ET.SubElement(do, "Wartosc").text = dlv_despatch
+
     # --- FaWiersz ---
+    delivery_date = delivery.get("date") if delivery else ""
     for idx, item in enumerate(items, 1):
         fw = ET.SubElement(fa, "FaWiersz")
         ET.SubElement(fw, "NrWierszaFa").text = str(idx)
         ET.SubElement(fw, "UU_ID").text = str(uuid.uuid4()).replace("-", "")[:32]
-        ET.SubElement(fw, "P_6A").text = sales_date
+        ET.SubElement(fw, "P_6A").text = delivery_date or sales_date
         ET.SubElement(fw, "P_7").text = item["description"]
+        item_code = item.get("item_code", "")
+        if item_code:
+            ET.SubElement(fw, "Indeks").text = item_code
+        ean = item.get("ean", "")
+        if ean:
+            ET.SubElement(fw, "GTIN").text = ean
         ET.SubElement(fw, "P_8A").text = item.get("unit", "szt")
         ET.SubElement(fw, "P_8B").text = item["quantity"]
         ET.SubElement(fw, "P_9A").text = str(money(item["unit_price"]))
         ET.SubElement(fw, "P_11").text = str(money(item["net_amount"]))
-        rate = normalize_vat_rate(item["tax_rate"], cfg_vat)
+        rate = normalize_vat_rate(
+            item["tax_rate"], cfg_vat, resolve_tcc(item)
+        )
         if rate is not None:
             rate_display = str(int(rate)) if rate == int(rate) else str(rate)
         else:
@@ -737,6 +899,15 @@ def build_ksef_xml(parsed, config):
         bank_desc = cfg_bank.get("opis", "")
         if bank_desc:
             ET.SubElement(rb, "OpisRachunku").text = bank_desc
+
+    # --- WarunkiTransakcji (order info in schema-defined location) ---
+    if order_number or order_date:
+        warunki = ET.SubElement(fa, "WarunkiTransakcji")
+        zamowienie = ET.SubElement(warunki, "Zamowienia")
+        if order_date:
+            ET.SubElement(zamowienie, "DataZamowienia").text = order_date
+        if order_number:
+            ET.SubElement(zamowienie, "NrZamowienia").text = order_number
 
     result = {
         "total_net": total_net,
@@ -815,7 +986,7 @@ def validate_ksef_xml(file_path):
                 total_vat = Decimal("0")
                 for suffix, label in [
                     ("1", "23%"), ("2", "8%"), ("3", "5%"),
-                    ("4", "special"), ("6", "0%"), ("7", "exempt"),
+                    ("4", "special"), ("6_1", "0%"), ("7", "exempt"),
                 ]:
                     p13 = fa.find(f"{ns}P_13_{suffix}")
                     p14 = fa.find(f"{ns}P_14_{suffix}")
