@@ -24,10 +24,25 @@ Skrypt korzysta wyłącznie ze standardowej biblioteki Pythona, więc nie wymaga
 
 ## Pliki w projekcie
 
-- `invoice_converter.py` — główny skrypt konwertujący
+- `invoice_converter.py` — główny skrypt konwertujący (CLI)
+- `ksef_gui.py` — interfejs graficzny (tkinter)
+- `Uruchom_KSeF.bat` — launcher Windows — kliknij dwukrotnie, aby uruchomić GUI
 - `ksef_config.json` — przykładowa konfiguracja użytkownika
 
-## Szybki start
+## Uruchomienie na Windows (dla osób nietechnicznych)
+
+1. Zainstaluj **Python 3.9+** ze strony https://www.python.org/downloads/
+   - Podczas instalacji **zaznacz**: `Add Python to PATH` oraz `tcl/tk and IDLE`
+2. Skopiuj cały folder projektu na komputer
+3. Kliknij dwukrotnie plik **`Uruchom_KSeF.bat`**
+4. W oknie programu:
+   - Wybierz folder z fakturami XML (przycisk „Wybierz…")
+   - Wybierz folder wyjściowy
+   - Opcjonalnie wskaż plik konfiguracyjny `ksef_config.json`
+   - Kliknij **Konwertuj**
+5. Wyniki pojawią się w folderze wyjściowym, a logi w dolnej części okna
+
+## Szybki start (wiersz poleceń)
 
 ### Konwersja jednego pliku
 
@@ -211,7 +226,7 @@ Domyślne mapowanie typów płatności:
 - Poprawność końcowego XML należy zweryfikować w docelowym środowisku KSeF lub oficjalnym narzędziu walidującym.
 - Dane wejściowe muszą mieć zgodną strukturę XML.
 - W przypadku nieprawidłowego lub niespójnego kodowania znaki narodowe mogą zostać uszkodzone już na etapie odczytu pliku wejściowego.
-- Szczegóły wykrytych błędów implementacyjnych opisano w pliku `BUG_REPORT.md`.
+- Szczegóły wykrytych błędów implementacyjnych opisano w pliku `CODE_REVIEW.md`.
 
 ## Możliwe zastosowania
 

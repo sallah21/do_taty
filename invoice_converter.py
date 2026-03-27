@@ -1141,8 +1141,8 @@ def generate_sample_config(output_path="ksef_config.json"):
     }
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(sample, f, indent=4, ensure_ascii=False)
-    print(f"Sample configuration generated: {output_path}")
-    print("Edit this file with your company details before converting invoices.")
+    logger.info("Konfiguracja wygenerowana: %s", output_path)
+    logger.info("Otwórz plik i uzupełnij dane firmy przed konwersją.")
 
 
 # ---------------------------------------------------------------------------
