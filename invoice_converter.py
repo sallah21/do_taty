@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -188,6 +189,19 @@ def detect_encoding(file_path):
     return "utf-8"
 
 
+_INVALID_AMP_PATTERN = re.compile(
+    r"&(?!(?:[A-Za-z][A-Za-z0-9]*|#[0-9]+|#x[0-9A-Fa-f]+);)"
+)
+
+
+def sanitize_xml_entities(content):
+    """Escape bare ampersands so XML parsing tolerates invalid entities."""
+    sanitized, count = _INVALID_AMP_PATTERN.subn("&amp;", content)
+    if count:
+        logger.warning("Escaped %d invalid '&' entities in input XML", count)
+    return sanitized
+
+
 def extract_nip(tax_id):
     """Extract clean NIP from a tax ID string (strip country prefix and dashes)."""
     if not tax_id:
@@ -306,6 +320,7 @@ def parse_input_xml(file_path):
             content = content[pos + 2:].lstrip()
         else:
             raise ConversionError("Malformed XML declaration: missing '?>' terminator")
+    content = sanitize_xml_entities(content)
     root = ET.fromstring(content)
 
     if root.tag != "Document-Invoice":
