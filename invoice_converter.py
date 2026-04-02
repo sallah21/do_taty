@@ -191,6 +191,7 @@ def detect_encoding(file_path):
 _INVALID_AMP_PATTERN = re.compile(
     r"&(?!(?:[A-Za-z][A-Za-z0-9]*|#[0-9]+|#x[0-9A-Fa-f]+);)"
 )
+_BROKEN_TAG_NAME_PATTERN = re.compile(r"<(/?)([A-Za-z0-9_.:-]+)\s+([A-Za-z0-9_.:-]+)>")
 
 
 def sanitize_xml_entities(content):
@@ -199,6 +200,14 @@ def sanitize_xml_entities(content):
     if count:
         logger.warning("Escaped %d invalid '&' entities in input XML", count)
     return sanitized
+
+
+def repair_broken_tag_names(content):
+    """Repair tag names split by whitespace/newlines (invalid XML)."""
+    repaired, count = _BROKEN_TAG_NAME_PATTERN.subn(r"<\1\2\3>", content)
+    if count:
+        logger.warning("Repaired %d broken tag name(s) in input XML", count)
+    return repaired
 
 
 def extract_nip(tax_id):
@@ -320,6 +329,7 @@ def parse_input_xml(file_path):
         else:
             raise ConversionError("Malformed XML declaration: missing '?>' terminator")
     content = sanitize_xml_entities(content)
+    content = repair_broken_tag_names(content)
     root = ET.fromstring(content)
 
     if root.tag != "Document-Invoice":
@@ -853,12 +863,13 @@ def build_ksef_xml(parsed, config):
     for idx, item in enumerate(items, 1):
         fw = ET.SubElement(fa, "FaWiersz")
         ET.SubElement(fw, "NrWierszaFa").text = str(idx)
-        uu_id_value = item.get("item_code", "")
+        item_code = item.get("item_code", "")
+        uu_id_value = item_code or str(idx)
         ET.SubElement(fw, "NrKatalogowy").text = uu_id_value
         ET.SubElement(fw, "P_6A").text = delivery_date or sales_date
         ET.SubElement(fw, "P_7").text = item["description"]
-        if uu_id_value:
-            ET.SubElement(fw, "Indeks").text = uu_id_value
+        if item_code:
+            ET.SubElement(fw, "Indeks").text = item_code
         ean = item.get("ean", "")
         if ean:
             ET.SubElement(fw, "GTIN").text = ean
