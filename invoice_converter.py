@@ -868,8 +868,8 @@ def build_ksef_xml(parsed, config):
         ET.SubElement(fw, "NrKatalogowy").text = uu_id_value
         ET.SubElement(fw, "P_6A").text = delivery_date or sales_date
         ET.SubElement(fw, "P_7").text = item["description"]
-        if item_code:
-            ET.SubElement(fw, "Indeks").text = item_code
+        # if item_code:
+        #     ET.SubElement(fw, "Indeks").text = item_code
         ean = item.get("ean", "")
         if ean:
             ET.SubElement(fw, "GTIN").text = ean
