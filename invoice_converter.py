@@ -19,7 +19,6 @@ import re
 import shutil
 import sys
 import tempfile
-# import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
@@ -854,12 +853,12 @@ def build_ksef_xml(parsed, config):
     for idx, item in enumerate(items, 1):
         fw = ET.SubElement(fa, "FaWiersz")
         ET.SubElement(fw, "NrWierszaFa").text = str(idx)
-        # uu_id_value = item.get("item_code", "")
-        # ET.SubElement(fw, "UU_ID").text = uu_id_value
+        uu_id_value = item.get("item_code", "")
+        ET.SubElement(fw, "NrKatalogowy").text = uu_id_value
         ET.SubElement(fw, "P_6A").text = delivery_date or sales_date
         ET.SubElement(fw, "P_7").text = item["description"]
-        # if uu_id_value:
-        #     ET.SubElement(fw, "Indeks").text = uu_id_value
+        if uu_id_value:
+            ET.SubElement(fw, "Indeks").text = uu_id_value
         ean = item.get("ean", "")
         if ean:
             ET.SubElement(fw, "GTIN").text = ean
