@@ -864,10 +864,8 @@ def build_ksef_xml(parsed, config):
         fw = ET.SubElement(fa, "FaWiersz")
         ET.SubElement(fw, "NrWierszaFa").text = str(idx)
         item_code = item.get("item_code", "")
-        uu_id_value = item_code or str(idx)
-        ET.SubElement(fw, "NrKatalogowy").text = uu_id_value
         ET.SubElement(fw, "P_6A").text = delivery_date or sales_date
-        ET.SubElement(fw, "P_7").text = item["description"]
+        ET.SubElement(fw, "P_7").text = item_code + " " + item["description"]
         # if item_code:
         #     ET.SubElement(fw, "Indeks").text = item_code
         ean = item.get("ean", "")
